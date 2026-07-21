@@ -33,14 +33,57 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/**
+ * s-r~google-lens dataset structure (ONE row per image):
+ * [
+ *   {
+ *     image_url: string,
+ *     match_count: number,
+ *     search_url: string,
+ *     matches: [
+ *       { title: string, link: string, source: string, thumbnail: string },
+ *       ...
+ *     ]
+ *   }
+ * ]
+ */
+function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[] {
+  const results: Match[] = []
+
+  for (const row of rows) {
+    // ---- Case 1: nested matches array (s-r~google-lens format) ----
+    if (Array.isArray(row['matches'])) {
+      for (const m of row['matches'] as Record<string, string>[]) {
+        const url = m['link'] || m['url'] || m['pageUrl'] || ''
+        if (url) {
+          results.push({
+            url,
+            title: m['title'] || '',
+            source: m['source'] || m['domain'] || '',
+          })
+        }
+      }
+      continue
+    }
+
+    // ---- Case 2: flat item ----
+    const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
+    if (url) {
+      results.push({
+        url,
+        title: (row['title'] as string) || '',
+        source: (row['source'] as string) || (row['domain'] as string) || '',
+      })
+    }
+  }
+
+  return results
+}
+
 /* ─── Apify async polling ─────────────────────────────── */
 
-// Returns the first non-empty dataset result, stops polling immediately.
-async function runApifyAsync(
-  imageUrl: string,
-  token: string
-): Promise<Match[]> {
-  // 1. Start the run (async — returns immediately with a runId)
+async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> {
+  // 1. Start run async
   const startRes = await fetch(
     `https://api.apify.com/v2/acts/s-r~google-lens/runs?token=${token}&memory=1024`,
     {
@@ -53,51 +96,51 @@ async function runApifyAsync(
     const txt = await startRes.text()
     throw new Error(`Apify start error ${startRes.status}: ${txt}`)
   }
-  const startData = await startRes.json() as { data: { id: string; status: string } }
+  const startData = await startRes.json() as { data: { id: string } }
   const runId = startData.data?.id
   if (!runId) throw new Error('Apify did not return a run ID')
 
-  // 2. Poll every 4 seconds — stop as soon as the dataset has items OR run finished
-  const deadline = Date.now() + 240_000 // 4 min max
-  while (Date.now() < deadline) {
-    await sleep(4000)
+  console.log(`[find-source] Apify run started: ${runId}`)
 
-    // Check run status
-    const statusRes = await fetch(
-      `https://api.apify.com/v2/actor-runs/${runId}?token=${token}`
-    )
+  // 2. Poll every 5 seconds
+  const deadline = Date.now() + 240_000
+  while (Date.now() < deadline) {
+    await sleep(5000)
+
+    const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${token}`)
     if (!statusRes.ok) continue
-    const statusData = await statusRes.json() as { data: { status: string; stats?: { itemCount?: number } } }
+
+    const statusData = await statusRes.json() as {
+      data: { status: string; stats?: { itemCount?: number } }
+    }
     const runStatus = statusData.data?.status
     const itemCount = statusData.data?.stats?.itemCount ?? 0
 
-    // If there are items in the dataset, fetch them right away
+    console.log(`[find-source] run=${runId} status=${runStatus} items=${itemCount}`)
+
     if (itemCount > 0) {
       const dataRes = await fetch(
-        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=20`
+        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`
       )
       if (dataRes.ok) {
         const rows = await dataRes.json() as Array<Record<string, unknown>>
-        const matches: Match[] = []
-        for (const row of rows) {
-          if (Array.isArray(row['matches'])) {
-            for (const m of row['matches'] as Record<string, string>[]) {
-              const url = m['url'] || m['link'] || ''
-              if (url) matches.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
-            }
-          }
-          // flat fallback
-          const url = (row['url'] || row['link']) as string | undefined
-          if (url && !matches.find(x => x.url === url)) {
-            matches.push({ url, title: (row['title'] as string) || '', source: (row['source'] as string) || '' })
-          }
-        }
+        console.log(`[find-source] raw first row keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
+        const matches = extractMatchesFromDataset(rows)
+        console.log(`[find-source] extracted ${matches.length} matches`)
         if (matches.length > 0) return matches
       }
     }
 
-    // If run finished (success or failure) stop polling
     if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) {
+      // Run finished — do a final fetch even if itemCount==0 (stats can lag)
+      const dataRes = await fetch(
+        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`
+      )
+      if (dataRes.ok) {
+        const rows = await dataRes.json() as Array<Record<string, unknown>>
+        console.log(`[find-source] final fetch first row keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
+        return extractMatchesFromDataset(rows)
+      }
       break
     }
   }
@@ -113,10 +156,7 @@ async function searchWithSerpApi(videoId: string, token: string): Promise<Match[
     const res = await fetch(`https://serpapi.com/search?${params}`, {
       signal: AbortSignal.timeout(30_000),
     })
-    if (!res.ok) {
-      const text = await res.text()
-      throw new Error(`SerpApi error ${res.status}: ${text}`)
-    }
+    if (!res.ok) throw new Error(`SerpApi error ${res.status}: ${await res.text()}`)
     const data = await res.json() as { visual_matches?: Array<Record<string, string>> }
     const matches = (data.visual_matches || [])
       .map((item) => ({ url: item['link'] || item['url'] || '', title: item['title'] || '', source: item['source'] || '' }))
@@ -139,10 +179,7 @@ export async function POST(req: NextRequest) {
 
     const videoId = extractVideoId(url.trim())
     if (!videoId) {
-      return NextResponse.json(
-        { error: 'Could not extract a valid YouTube video ID.' },
-        { status: 400 }
-      )
+      return NextResponse.json({ error: 'Could not extract a valid YouTube video ID.' }, { status: 400 })
     }
 
     const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
@@ -156,13 +193,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ videoId, thumbnailUrl, matches })
     }
 
-    // Apify
     const apifyToken = process.env.APIFY_API_TOKEN
     if (!apifyToken) {
       return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'APIFY_API_TOKEN is not configured.' })
     }
 
-    const thumbUrl = getThumbnailUrls(videoId)[2] // hqdefault — most reliable
+    const thumbUrl = getThumbnailUrls(videoId)[2] // hqdefault
     const matches = await runApifyAsync(thumbUrl, apifyToken)
     return NextResponse.json({ videoId, thumbnailUrl, matches })
 
