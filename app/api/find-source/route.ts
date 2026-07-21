@@ -1,10 +1,44 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+type Match = { url: string; title: string; source: string }
+
 type ApifyActor = {
   id: string
-  buildInput: (imageUrl: string) => Record<string, unknown>
-  mapItem: (item: Record<string, string>) => { url: string; title: string; source: string }
   memory: number
+  buildInput: (imageUrl: string) => Record<string, unknown>
+  extractMatches: (data: unknown) => Match[]
+}
+
+// s-r/google-lens returns: [{ image_url, match_count, matches: [{url,title,source}], search_url }]
+function extractSrGoogleLens(data: unknown): Match[] {
+  if (!Array.isArray(data)) return []
+  const results: Match[] = []
+  for (const row of data) {
+    const r = row as Record<string, unknown>
+    // nested matches array inside each dataset item
+    if (Array.isArray(r['matches'])) {
+      for (const m of r['matches'] as Record<string, string>[]) {
+        const url = m['url'] || m['link'] || m['pageUrl'] || ''
+        if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
+      }
+    }
+    // flat item fallback
+    const url = r['url'] as string || r['link'] as string || ''
+    if (url && !results.find(x => x.url === url)) {
+      results.push({ url, title: r['title'] as string || '', source: r['source'] as string || '' })
+    }
+  }
+  return results
+}
+
+// Generic flat array extractor for other actors
+function extractFlat(data: unknown): Match[] {
+  if (!Array.isArray(data)) return []
+  return (data as Record<string, string>[]).map((item) => ({
+    url: item['url'] || item['link'] || item['pageUrl'] || '',
+    title: item['title'] || item['name'] || item['description'] || '',
+    source: item['source'] || item['displayLink'] || item['domain'] || '',
+  })).filter((m) => m.url)
 }
 
 const APIFY_ACTORS: ApifyActor[] = [
@@ -12,41 +46,25 @@ const APIFY_ACTORS: ApifyActor[] = [
     id: 's-r~google-lens',
     memory: 1024,
     buildInput: (imageUrl) => ({ image_urls: [imageUrl] }),
-    mapItem: (item) => ({
-      url: item['url'] || item['link'] || item['pageUrl'] || '',
-      title: item['title'] || item['name'] || item['description'] || '',
-      source: item['source'] || item['displayLink'] || item['domain'] || '',
-    }),
+    extractMatches: extractSrGoogleLens,
   },
   {
     id: 'thodor~google-lens-exact-matches',
     memory: 1024,
     buildInput: (imageUrl) => ({ imageUrl }),
-    mapItem: (item) => ({
-      url: item['url'] || item['link'] || item['pageUrl'] || '',
-      title: item['title'] || item['name'] || item['description'] || '',
-      source: item['source'] || item['displayLink'] || item['domain'] || '',
-    }),
+    extractMatches: extractFlat,
   },
   {
     id: 'prodiger~google-lens-scraper',
     memory: 1024,
     buildInput: (imageUrl) => ({ imageUrls: [imageUrl], searchTypes: ['visual-match'] }),
-    mapItem: (item) => ({
-      url: item['url'] || item['link'] || item['pageUrl'] || '',
-      title: item['title'] || item['name'] || item['description'] || '',
-      source: item['source'] || item['displayLink'] || item['domain'] || '',
-    }),
+    extractMatches: extractFlat,
   },
   {
     id: 'borderline~google-lens',
     memory: 1024,
     buildInput: (imageUrl) => ({ imageUrls: [{ url: imageUrl }], searchTypes: ['visual-match'] }),
-    mapItem: (item) => ({
-      url: item['url'] || item['link'] || item['pageUrl'] || '',
-      title: item['title'] || item['name'] || item['description'] || '',
-      source: item['source'] || item['displayLink'] || item['domain'] || '',
-    }),
+    extractMatches: extractFlat,
   },
 ]
 
@@ -75,32 +93,26 @@ function extractVideoId(inputUrl: string): string | null {
   }
 }
 
-async function runApifyActor(
-  actor: ApifyActor,
-  imageUrl: string,
-  token: string
-): Promise<Array<{ url: string; title: string; source: string }>> {
-  // 120s timeout, 1024MB memory for reliable browser-based actors
+async function runApifyActor(actor: ApifyActor, imageUrl: string, token: string): Promise<Match[]> {
   const endpoint = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?token=${token}&timeout=120&memory=${actor.memory}`
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(actor.buildInput(imageUrl)),
-    signal: AbortSignal.timeout(130_000), // 130s fetch timeout (> actor timeout)
+    signal: AbortSignal.timeout(130_000),
   })
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`Apify [${actor.id}] ${res.status}: ${text}`)
   }
-  const data = await res.json() as Array<Record<string, string>>
-  if (!Array.isArray(data)) return []
-  return data.map(actor.mapItem).filter((m) => m.url && m.url.length > 0)
+  const data = await res.json()
+  return actor.extractMatches(data)
 }
 
 async function searchWithApify(
   videoId: string,
   token: string
-): Promise<{ matches: Array<{ url: string; title: string; source: string }>; actorUsed: string; thumbnailUsed: string }> {
+): Promise<{ matches: Match[]; actorUsed: string; thumbnailUsed: string }> {
   const thumbnails = getThumbnailUrls(videoId)
 
   for (const actor of APIFY_ACTORS) {
@@ -130,7 +142,7 @@ async function searchWithApify(
 async function searchWithSerpApi(
   videoId: string,
   token: string
-): Promise<{ matches: Array<{ url: string; title: string; source: string }>; thumbnailUsed: string }> {
+): Promise<{ matches: Match[]; thumbnailUsed: string }> {
   const thumbnails = getThumbnailUrls(videoId)
 
   for (const thumbUrl of thumbnails) {
@@ -156,7 +168,7 @@ async function searchWithSerpApi(
   return { matches: [], thumbnailUsed: thumbnails[0] }
 }
 
-export const maxDuration = 150 // Vercel max function duration in seconds
+export const maxDuration = 150
 
 export async function POST(req: NextRequest) {
   try {
