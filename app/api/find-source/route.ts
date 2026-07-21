@@ -1,5 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+// Active Apify actors for Google Lens (ordered by preference)
+const APIFY_ACTORS = [
+  {
+    id: 'borderline~google-lens',
+    inputKey: 'imageUrl',
+    mapItem: (item: Record<string, string>) => ({
+      url: item['url'] || item['link'] || item['pageUrl'] || '',
+      title: item['title'] || item['name'] || item['description'] || '',
+      source: item['source'] || item['displayLink'] || item['domain'] || '',
+    }),
+  },
+  {
+    id: 'newyear~google-reverse-image-search',
+    inputKey: 'imageUrl',
+    mapItem: (item: Record<string, string>) => ({
+      url: item['url'] || item['link'] || item['pageUrl'] || '',
+      title: item['title'] || item['name'] || item['description'] || '',
+      source: item['source'] || item['displayLink'] || item['domain'] || '',
+    }),
+  },
+]
+
 function extractVideoId(inputUrl: string): string | null {
   try {
     const u = new URL(inputUrl)
@@ -19,31 +41,47 @@ function extractVideoId(inputUrl: string): string | null {
   }
 }
 
-async function searchWithApify(
+async function runApifyActor(
+  actorId: string,
+  inputKey: string,
   imageUrl: string,
   token: string
-): Promise<Array<{ url: string; title: string; source: string }>> {
-  const res = await fetch(
-    `https://api.apify.com/v2/acts/jirimoravcik~google-lens/run-sync-get-dataset-items?token=${token}&timeout=90&memory=256`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageUrl, maxResults: 10 }),
-    }
-  )
+): Promise<Array<Record<string, string>>> {
+  const url = `https://api.apify.com/v2/acts/${actorId}/run-sync-get-dataset-items?token=${token}&timeout=90&memory=256`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ [inputKey]: imageUrl, maxResults: 10 }),
+  })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(`Apify error ${res.status}: ${text}`)
+    throw new Error(`Apify error ${res.status} [${actorId}]: ${text}`)
   }
   const data = await res.json() as Array<Record<string, string>>
   if (!Array.isArray(data)) return []
   return data
-    .map((item) => ({
-      url: item['url'] || item['link'] || item['pageUrl'] || '',
-      title: item['title'] || item['name'] || item['description'] || '',
-      source: item['source'] || item['displayLink'] || item['domain'] || '',
-    }))
-    .filter((m) => m.url)
+}
+
+async function searchWithApify(
+  imageUrl: string,
+  token: string
+): Promise<Array<{ url: string; title: string; source: string }>> {
+  let lastError: Error | null = null
+
+  for (const actor of APIFY_ACTORS) {
+    try {
+      const data = await runApifyActor(actor.id, actor.inputKey, imageUrl, token)
+      const mapped = data.map(actor.mapItem).filter((m) => m.url)
+      if (mapped.length > 0) return mapped
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err))
+      // try next actor
+      continue
+    }
+  }
+
+  if (lastError) throw lastError
+  return []
 }
 
 async function searchWithSerpApi(
