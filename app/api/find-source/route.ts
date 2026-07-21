@@ -4,11 +4,13 @@ type ApifyActor = {
   id: string
   buildInput: (imageUrl: string) => Record<string, unknown>
   mapItem: (item: Record<string, string>) => { url: string; title: string; source: string }
+  memory: number
 }
 
 const APIFY_ACTORS: ApifyActor[] = [
   {
     id: 's-r~google-lens',
+    memory: 1024,
     buildInput: (imageUrl) => ({ image_urls: [imageUrl] }),
     mapItem: (item) => ({
       url: item['url'] || item['link'] || item['pageUrl'] || '',
@@ -18,6 +20,7 @@ const APIFY_ACTORS: ApifyActor[] = [
   },
   {
     id: 'thodor~google-lens-exact-matches',
+    memory: 1024,
     buildInput: (imageUrl) => ({ imageUrl }),
     mapItem: (item) => ({
       url: item['url'] || item['link'] || item['pageUrl'] || '',
@@ -27,6 +30,7 @@ const APIFY_ACTORS: ApifyActor[] = [
   },
   {
     id: 'prodiger~google-lens-scraper',
+    memory: 1024,
     buildInput: (imageUrl) => ({ imageUrls: [imageUrl], searchTypes: ['visual-match'] }),
     mapItem: (item) => ({
       url: item['url'] || item['link'] || item['pageUrl'] || '',
@@ -36,6 +40,7 @@ const APIFY_ACTORS: ApifyActor[] = [
   },
   {
     id: 'borderline~google-lens',
+    memory: 1024,
     buildInput: (imageUrl) => ({ imageUrls: [{ url: imageUrl }], searchTypes: ['visual-match'] }),
     mapItem: (item) => ({
       url: item['url'] || item['link'] || item['pageUrl'] || '',
@@ -45,19 +50,10 @@ const APIFY_ACTORS: ApifyActor[] = [
   },
 ]
 
-// YouTube thumbnail qualities to try in order (best → fallback)
-const THUMBNAIL_QUALITIES = [
-  'maxresdefault',
-  'sddefault',
-  'hqdefault',
-  'mqdefault',
-  '0',
-]
+const THUMBNAIL_QUALITIES = ['maxresdefault', 'sddefault', 'hqdefault', 'mqdefault', '0']
 
 function getThumbnailUrls(videoId: string): string[] {
-  return THUMBNAIL_QUALITIES.map(
-    (q) => `https://i.ytimg.com/vi/${videoId}/${q}.jpg`
-  )
+  return THUMBNAIL_QUALITIES.map((q) => `https://i.ytimg.com/vi/${videoId}/${q}.jpg`)
 }
 
 function extractVideoId(inputUrl: string): string | null {
@@ -84,11 +80,13 @@ async function runApifyActor(
   imageUrl: string,
   token: string
 ): Promise<Array<{ url: string; title: string; source: string }>> {
-  const endpoint = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?token=${token}&timeout=90&memory=256`
+  // 120s timeout, 1024MB memory for reliable browser-based actors
+  const endpoint = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?token=${token}&timeout=120&memory=${actor.memory}`
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(actor.buildInput(imageUrl)),
+    signal: AbortSignal.timeout(130_000), // 130s fetch timeout (> actor timeout)
   })
   if (!res.ok) {
     const text = await res.text()
@@ -112,16 +110,16 @@ async function searchWithApify(
         if (matches.length > 0) {
           return { matches, actorUsed: actor.id, thumbnailUsed: thumbUrl }
         }
-        // Got empty results — try next thumbnail quality
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const isSkippable =
           msg.includes('404') ||
           msg.includes('record-not-found') ||
           msg.includes('actor-is-not-rented') ||
-          msg.includes('403')
-        if (isSkippable) break // skip all thumbnails for this actor
-        // non-fatal error (e.g. invalid-input) — try next thumbnail
+          msg.includes('403') ||
+          msg.includes('timeout') ||
+          msg.includes('AbortError')
+        if (isSkippable) break
       }
     }
   }
@@ -136,12 +134,10 @@ async function searchWithSerpApi(
   const thumbnails = getThumbnailUrls(videoId)
 
   for (const thumbUrl of thumbnails) {
-    const params = new URLSearchParams({
-      engine: 'google_lens',
-      url: thumbUrl,
-      api_key: token,
+    const params = new URLSearchParams({ engine: 'google_lens', url: thumbUrl, api_key: token })
+    const res = await fetch(`https://serpapi.com/search?${params}`, {
+      signal: AbortSignal.timeout(30_000),
     })
-    const res = await fetch(`https://serpapi.com/search?${params}`)
     if (!res.ok) {
       const text = await res.text()
       throw new Error(`SerpApi error ${res.status}: ${text}`)
@@ -154,14 +150,13 @@ async function searchWithSerpApi(
         source: item['source'] || '',
       }))
       .filter((m) => m.url)
-
-    if (matches.length > 0) {
-      return { matches, thumbnailUsed: thumbUrl }
-    }
+    if (matches.length > 0) return { matches, thumbnailUsed: thumbUrl }
   }
 
   return { matches: [], thumbnailUsed: thumbnails[0] }
 }
+
+export const maxDuration = 150 // Vercel max function duration in seconds
 
 export async function POST(req: NextRequest) {
   try {
@@ -175,21 +170,18 @@ export async function POST(req: NextRequest) {
     const videoId = extractVideoId(url.trim())
     if (!videoId) {
       return NextResponse.json(
-        { error: 'Could not extract a valid YouTube video ID. Supported formats: youtube.com/shorts/ID, youtu.be/ID, youtube.com/watch?v=ID' },
+        { error: 'Could not extract a valid YouTube video ID. Supported: youtube.com/shorts/ID, youtu.be/ID, youtube.com/watch?v=ID' },
         { status: 400 }
       )
     }
 
-    // Show the best available thumbnail in the UI
     const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
 
     if (provider === 'serpapi') {
       const serpToken = process.env.SERPAPI_KEY
       if (!serpToken) {
         return NextResponse.json({
-          videoId,
-          thumbnailUrl,
-          matches: [],
+          videoId, thumbnailUrl, matches: [],
           note: 'SERPAPI_KEY is not configured. Add it in Vercel Environment Variables.',
         })
       }
@@ -197,13 +189,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ videoId, thumbnailUrl, matches, thumbnailUsed })
     }
 
-    // provider === 'apify'
     const apifyToken = process.env.APIFY_API_TOKEN
     if (!apifyToken) {
       return NextResponse.json({
-        videoId,
-        thumbnailUrl,
-        matches: [],
+        videoId, thumbnailUrl, matches: [],
         note: 'APIFY_API_TOKEN is not configured. Add it in Vercel Environment Variables.',
       })
     }
