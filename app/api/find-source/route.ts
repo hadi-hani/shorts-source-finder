@@ -1,78 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+export const maxDuration = 300
+
 type Match = { url: string; title: string; source: string }
 
-type ApifyActor = {
-  id: string
-  memory: number
-  buildInput: (imageUrl: string) => Record<string, unknown>
-  extractMatches: (data: unknown) => Match[]
-}
-
-// s-r/google-lens returns: [{ image_url, match_count, matches: [{url,title,source}], search_url }]
-function extractSrGoogleLens(data: unknown): Match[] {
-  if (!Array.isArray(data)) return []
-  const results: Match[] = []
-  for (const row of data) {
-    const r = row as Record<string, unknown>
-    // nested matches array inside each dataset item
-    if (Array.isArray(r['matches'])) {
-      for (const m of r['matches'] as Record<string, string>[]) {
-        const url = m['url'] || m['link'] || m['pageUrl'] || ''
-        if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
-      }
-    }
-    // flat item fallback
-    const url = r['url'] as string || r['link'] as string || ''
-    if (url && !results.find(x => x.url === url)) {
-      results.push({ url, title: r['title'] as string || '', source: r['source'] as string || '' })
-    }
-  }
-  return results
-}
-
-// Generic flat array extractor for other actors
-function extractFlat(data: unknown): Match[] {
-  if (!Array.isArray(data)) return []
-  return (data as Record<string, string>[]).map((item) => ({
-    url: item['url'] || item['link'] || item['pageUrl'] || '',
-    title: item['title'] || item['name'] || item['description'] || '',
-    source: item['source'] || item['displayLink'] || item['domain'] || '',
-  })).filter((m) => m.url)
-}
-
-const APIFY_ACTORS: ApifyActor[] = [
-  {
-    id: 's-r~google-lens',
-    memory: 1024,
-    buildInput: (imageUrl) => ({ image_urls: [imageUrl] }),
-    extractMatches: extractSrGoogleLens,
-  },
-  {
-    id: 'thodor~google-lens-exact-matches',
-    memory: 1024,
-    buildInput: (imageUrl) => ({ imageUrl }),
-    extractMatches: extractFlat,
-  },
-  {
-    id: 'prodiger~google-lens-scraper',
-    memory: 1024,
-    buildInput: (imageUrl) => ({ imageUrls: [imageUrl], searchTypes: ['visual-match'] }),
-    extractMatches: extractFlat,
-  },
-  {
-    id: 'borderline~google-lens',
-    memory: 1024,
-    buildInput: (imageUrl) => ({ imageUrls: [{ url: imageUrl }], searchTypes: ['visual-match'] }),
-    extractMatches: extractFlat,
-  },
-]
-
-const THUMBNAIL_QUALITIES = ['maxresdefault', 'sddefault', 'hqdefault', 'mqdefault', '0']
-
-function getThumbnailUrls(videoId: string): string[] {
-  return THUMBNAIL_QUALITIES.map((q) => `https://i.ytimg.com/vi/${videoId}/${q}.jpg`)
-}
+/* ─── helpers ─────────────────────────────────────────── */
 
 function extractVideoId(inputUrl: string): string | null {
   try {
@@ -88,64 +20,95 @@ function extractVideoId(inputUrl: string): string | null {
     const v = u.searchParams.get('v')
     if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v
     return null
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
-async function runApifyActor(actor: ApifyActor, imageUrl: string, token: string): Promise<Match[]> {
-  const endpoint = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?token=${token}&timeout=120&memory=${actor.memory}`
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(actor.buildInput(imageUrl)),
-    signal: AbortSignal.timeout(130_000),
-  })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`Apify [${actor.id}] ${res.status}: ${text}`)
-  }
-  const data = await res.json()
-  return actor.extractMatches(data)
+function getThumbnailUrls(videoId: string): string[] {
+  return ['maxresdefault', 'sddefault', 'hqdefault', '0'].map(
+    (q) => `https://i.ytimg.com/vi/${videoId}/${q}.jpg`
+  )
 }
 
-async function searchWithApify(
-  videoId: string,
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+/* ─── Apify async polling ─────────────────────────────── */
+
+// Returns the first non-empty dataset result, stops polling immediately.
+async function runApifyAsync(
+  imageUrl: string,
   token: string
-): Promise<{ matches: Match[]; actorUsed: string; thumbnailUsed: string }> {
-  const thumbnails = getThumbnailUrls(videoId)
+): Promise<Match[]> {
+  // 1. Start the run (async — returns immediately with a runId)
+  const startRes = await fetch(
+    `https://api.apify.com/v2/acts/s-r~google-lens/runs?token=${token}&memory=1024`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_urls: [imageUrl] }),
+    }
+  )
+  if (!startRes.ok) {
+    const txt = await startRes.text()
+    throw new Error(`Apify start error ${startRes.status}: ${txt}`)
+  }
+  const startData = await startRes.json() as { data: { id: string; status: string } }
+  const runId = startData.data?.id
+  if (!runId) throw new Error('Apify did not return a run ID')
 
-  for (const actor of APIFY_ACTORS) {
-    for (const thumbUrl of thumbnails) {
-      try {
-        const matches = await runApifyActor(actor, thumbUrl, token)
-        if (matches.length > 0) {
-          return { matches, actorUsed: actor.id, thumbnailUsed: thumbUrl }
+  // 2. Poll every 4 seconds — stop as soon as the dataset has items OR run finished
+  const deadline = Date.now() + 240_000 // 4 min max
+  while (Date.now() < deadline) {
+    await sleep(4000)
+
+    // Check run status
+    const statusRes = await fetch(
+      `https://api.apify.com/v2/actor-runs/${runId}?token=${token}`
+    )
+    if (!statusRes.ok) continue
+    const statusData = await statusRes.json() as { data: { status: string; stats?: { itemCount?: number } } }
+    const runStatus = statusData.data?.status
+    const itemCount = statusData.data?.stats?.itemCount ?? 0
+
+    // If there are items in the dataset, fetch them right away
+    if (itemCount > 0) {
+      const dataRes = await fetch(
+        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=20`
+      )
+      if (dataRes.ok) {
+        const rows = await dataRes.json() as Array<Record<string, unknown>>
+        const matches: Match[] = []
+        for (const row of rows) {
+          if (Array.isArray(row['matches'])) {
+            for (const m of row['matches'] as Record<string, string>[]) {
+              const url = m['url'] || m['link'] || ''
+              if (url) matches.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
+            }
+          }
+          // flat fallback
+          const url = (row['url'] || row['link']) as string | undefined
+          if (url && !matches.find(x => x.url === url)) {
+            matches.push({ url, title: (row['title'] as string) || '', source: (row['source'] as string) || '' })
+          }
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        const isSkippable =
-          msg.includes('404') ||
-          msg.includes('record-not-found') ||
-          msg.includes('actor-is-not-rented') ||
-          msg.includes('403') ||
-          msg.includes('timeout') ||
-          msg.includes('AbortError')
-        if (isSkippable) break
+        if (matches.length > 0) return matches
       }
+    }
+
+    // If run finished (success or failure) stop polling
+    if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) {
+      break
     }
   }
 
-  return { matches: [], actorUsed: 'none', thumbnailUsed: thumbnails[0] }
+  return []
 }
 
-async function searchWithSerpApi(
-  videoId: string,
-  token: string
-): Promise<{ matches: Match[]; thumbnailUsed: string }> {
-  const thumbnails = getThumbnailUrls(videoId)
+/* ─── SerpApi ─────────────────────────────────────────── */
 
-  for (const thumbUrl of thumbnails) {
+async function searchWithSerpApi(videoId: string, token: string): Promise<Match[]> {
+  for (const thumbUrl of getThumbnailUrls(videoId)) {
     const params = new URLSearchParams({ engine: 'google_lens', url: thumbUrl, api_key: token })
     const res = await fetch(`https://serpapi.com/search?${params}`, {
       signal: AbortSignal.timeout(30_000),
@@ -156,24 +119,19 @@ async function searchWithSerpApi(
     }
     const data = await res.json() as { visual_matches?: Array<Record<string, string>> }
     const matches = (data.visual_matches || [])
-      .map((item) => ({
-        url: item['link'] || item['url'] || '',
-        title: item['title'] || '',
-        source: item['source'] || '',
-      }))
+      .map((item) => ({ url: item['link'] || item['url'] || '', title: item['title'] || '', source: item['source'] || '' }))
       .filter((m) => m.url)
-    if (matches.length > 0) return { matches, thumbnailUsed: thumbUrl }
+    if (matches.length > 0) return matches
   }
-
-  return { matches: [], thumbnailUsed: thumbnails[0] }
+  return []
 }
 
-export const maxDuration = 150
+/* ─── Route handler ───────────────────────────────────── */
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json() as { url: string; provider?: string }
-    const { url, provider = 'serpapi' } = body
+    const { url, provider = 'apify' } = body
 
     if (!url || typeof url !== 'string') {
       return NextResponse.json({ error: 'Please provide a valid YouTube URL' }, { status: 400 })
@@ -182,7 +140,7 @@ export async function POST(req: NextRequest) {
     const videoId = extractVideoId(url.trim())
     if (!videoId) {
       return NextResponse.json(
-        { error: 'Could not extract a valid YouTube video ID. Supported: youtube.com/shorts/ID, youtu.be/ID, youtube.com/watch?v=ID' },
+        { error: 'Could not extract a valid YouTube video ID.' },
         { status: 400 }
       )
     }
@@ -192,25 +150,21 @@ export async function POST(req: NextRequest) {
     if (provider === 'serpapi') {
       const serpToken = process.env.SERPAPI_KEY
       if (!serpToken) {
-        return NextResponse.json({
-          videoId, thumbnailUrl, matches: [],
-          note: 'SERPAPI_KEY is not configured. Add it in Vercel Environment Variables.',
-        })
+        return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'SERPAPI_KEY is not configured.' })
       }
-      const { matches, thumbnailUsed } = await searchWithSerpApi(videoId, serpToken)
-      return NextResponse.json({ videoId, thumbnailUrl, matches, thumbnailUsed })
+      const matches = await searchWithSerpApi(videoId, serpToken)
+      return NextResponse.json({ videoId, thumbnailUrl, matches })
     }
 
+    // Apify
     const apifyToken = process.env.APIFY_API_TOKEN
     if (!apifyToken) {
-      return NextResponse.json({
-        videoId, thumbnailUrl, matches: [],
-        note: 'APIFY_API_TOKEN is not configured. Add it in Vercel Environment Variables.',
-      })
+      return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'APIFY_API_TOKEN is not configured.' })
     }
 
-    const { matches, actorUsed, thumbnailUsed } = await searchWithApify(videoId, apifyToken)
-    return NextResponse.json({ videoId, thumbnailUrl, matches, actorUsed, thumbnailUsed })
+    const thumbUrl = getThumbnailUrls(videoId)[2] // hqdefault — most reliable
+    const matches = await runApifyAsync(thumbUrl, apifyToken)
+    return NextResponse.json({ videoId, thumbnailUrl, matches })
 
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal server error'
