@@ -33,10 +33,6 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-/**
- * Extracts matches from the MaNVYRogwHemtywEz actor output.
- * Also handles the legacy s-r~google-lens format as fallback.
- */
 function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[] {
   const results: Match[] = []
 
@@ -88,13 +84,17 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
 /* ─── Apify async polling ─────────────────────────────── */
 
 async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> {
-  // 1. Start run async using MaNVYRogwHemtywEz actor
+  // Start run — include searchTypes (required by MaNVYRogwHemtywEz)
   const startRes = await fetch(
     `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=1024`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageUrl }),
+      body: JSON.stringify({
+        imageUrl,
+        imageUrls: [imageUrl],
+        searchTypes: ['visualMatches'],
+      }),
     }
   )
   if (!startRes.ok) {
@@ -107,7 +107,7 @@ async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> 
 
   console.log(`[find-source] Apify run started: ${runId}`)
 
-  // 2. Poll every 5 seconds
+  // Poll every 5 seconds
   const deadline = Date.now() + 240_000
   while (Date.now() < deadline) {
     await sleep(5000)
@@ -137,7 +137,6 @@ async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> 
     }
 
     if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) {
-      // Run finished — do a final fetch even if itemCount==0 (stats can lag)
       const dataRes = await fetch(
         `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`
       )
