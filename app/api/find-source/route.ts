@@ -34,24 +34,29 @@ function sleep(ms: number) {
 }
 
 /**
- * s-r~google-lens dataset structure (ONE row per image):
- * [
- *   {
- *     image_url: string,
- *     match_count: number,
- *     search_url: string,
- *     matches: [
- *       { title: string, link: string, source: string, thumbnail: string },
- *       ...
- *     ]
- *   }
- * ]
+ * Extracts matches from the MaNVYRogwHemtywEz actor output.
+ * Also handles the legacy s-r~google-lens format as fallback.
  */
 function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[] {
   const results: Match[] = []
 
   for (const row of rows) {
-    // ---- Case 1: nested matches array (s-r~google-lens format) ----
+    // ---- Case 1: MaNVYRogwHemtywEz format — visualMatches array ----
+    if (Array.isArray(row['visualMatches'])) {
+      for (const m of row['visualMatches'] as Record<string, string>[]) {
+        const url = m['link'] || m['url'] || m['pageUrl'] || ''
+        if (url) {
+          results.push({
+            url,
+            title: m['title'] || '',
+            source: m['source'] || m['domain'] || '',
+          })
+        }
+      }
+      continue
+    }
+
+    // ---- Case 2: legacy s-r~google-lens format — matches array ----
     if (Array.isArray(row['matches'])) {
       for (const m of row['matches'] as Record<string, string>[]) {
         const url = m['link'] || m['url'] || m['pageUrl'] || ''
@@ -66,7 +71,7 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
       continue
     }
 
-    // ---- Case 2: flat item ----
+    // ---- Case 3: flat item ----
     const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
     if (url) {
       results.push({
@@ -83,13 +88,13 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
 /* ─── Apify async polling ─────────────────────────────── */
 
 async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> {
-  // 1. Start run async
+  // 1. Start run async using MaNVYRogwHemtywEz actor
   const startRes = await fetch(
-    `https://api.apify.com/v2/acts/s-r~google-lens/runs?token=${token}&memory=1024`,
+    `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=1024`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_urls: [imageUrl] }),
+      body: JSON.stringify({ imageUrl }),
     }
   )
   if (!startRes.ok) {
