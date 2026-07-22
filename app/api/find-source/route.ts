@@ -23,7 +23,112 @@ function extractVideoId(inputUrl: string): string | null {
   } catch { return null }
 }
 
-function sleep(ms: number) {
+/* ─── Method 1: YouTube oEmbed (free, no API key needed) ─ */
+
+async function getYouTubeOEmbed(videoId: string): Promise<Match[]> {
+  try {
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`
+    const oEmbedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`
+    const res = await fetch(oEmbedUrl, { signal: AbortSignal.timeout(10_000) })
+    if (!res.ok) {
+      console.log(`[find-source] oEmbed failed: ${res.status}`)
+      return []
+    }
+    const data = await res.json() as {
+      title?: string
+      author_name?: string
+      author_url?: string
+      thumbnail_url?: string
+    }
+    if (data.title) {
+      console.log(`[find-source] oEmbed success: "${data.title}" by ${data.author_name}`)
+      return [{
+        url: videoUrl,
+        title: data.title,
+        source: data.author_name || 'YouTube',
+      }]
+    }
+    return []
+  } catch (e) {
+    console.warn('[find-source] oEmbed error:', e)
+    return []
+  }
+}
+
+/* ─── Method 2: YouTube Data API v3 (if key available) ─── */
+
+async function getYouTubeDataAPI(videoId: string, apiKey: string): Promise<Match[]> {
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}&key=${apiKey}`
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
+    if (!res.ok) {
+      console.log(`[find-source] YouTube Data API failed: ${res.status}`)
+      return []
+    }
+    const data = await res.json() as {
+      items?: Array<{
+        snippet?: {
+          title?: string
+          channelTitle?: string
+          description?: string
+        }
+      }>
+    }
+    const item = data.items?.[0]
+    if (item?.snippet?.title) {
+      console.log(`[find-source] YouTube Data API success: "${item.snippet.title}"`)
+      return [{
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        title: item.snippet.title,
+        source: item.snippet.channelTitle || 'YouTube',
+      }]
+    }
+    return []
+  } catch (e) {
+    console.warn('[find-source] YouTube Data API error:', e)
+    return []
+  }
+}
+
+/* ─── Method 3: SerpApi Google Lens (reverse image) ──── */
+
+async function searchWithSerpApi(videoId: string, token: string): Promise<Match[]> {
+  const thumbUrls = [
+    `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+  ]
+  for (const thumbUrl of thumbUrls) {
+    try {
+      const params = new URLSearchParams({ engine: 'google_lens', url: thumbUrl, api_key: token })
+      const res = await fetch(`https://serpapi.com/search?${params}`, {
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!res.ok) {
+        console.log(`[find-source] SerpApi error ${res.status}`)
+        continue
+      }
+      const data = await res.json() as { visual_matches?: Array<Record<string, string>> }
+      const matches = (data.visual_matches || [])
+        .map((item) => ({
+          url: item['link'] || item['url'] || '',
+          title: item['title'] || '',
+          source: item['source'] || '',
+        }))
+        .filter((m) => m.url)
+      if (matches.length > 0) {
+        console.log(`[find-source] SerpApi found ${matches.length} visual matches`)
+        return matches
+      }
+    } catch (e) {
+      console.warn('[find-source] SerpApi attempt failed:', e)
+    }
+  }
+  return []
+}
+
+/* ─── Method 4: Apify Google Lens actor (fallback) ──── */
+
+async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
@@ -39,166 +144,84 @@ async function fetchThumbnailAsBase64(videoId: string): Promise<string> {
       if (!res.ok) continue
       const arrayBuffer = await res.arrayBuffer()
       const base64 = Buffer.from(arrayBuffer).toString('base64')
-      if (base64.length > 1000) {
-        console.log(`[find-source] fetched thumbnail from ${url} (${base64.length} chars base64)`)
-        return base64
-      }
-    } catch (e) {
-      console.warn(`[find-source] thumbnail fetch failed for ${url}:`, e)
-    }
+      if (base64.length > 1000) return base64
+    } catch { /* try next */ }
   }
-  throw new Error('Could not fetch a valid YouTube thumbnail for base64 conversion.')
+  throw new Error('Could not fetch YouTube thumbnail')
 }
 
 function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[] {
   const results: Match[] = []
-
   for (const row of rows) {
-    // Log all keys for debugging
-    console.log(`[find-source] row keys: ${Object.keys(row).join(', ')}`)
-
-    // Try every known key variant the actor might return
     const candidates = [
-      row['visual-match'],   // kebab-case — confirmed from logs
-      row['visualMatches'],  // camelCase
+      row['visual-match'],
+      row['visualMatches'],
       row['visualMatch'],
       row['matches'],
       row['results'],
     ]
-
     let handled = false
     for (const candidate of candidates) {
       if (Array.isArray(candidate) && candidate.length > 0) {
         for (const m of candidate as Record<string, string>[]) {
           const url = m['link'] || m['url'] || m['pageUrl'] || ''
-          if (url) results.push({
-            url,
-            title: m['title'] || m['name'] || '',
-            source: m['source'] || m['domain'] || m['siteName'] || '',
-          })
+          if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
         }
         handled = true
         break
       }
     }
-
     if (!handled) {
-      // Flat item fallback
       const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
-      if (url) results.push({
-        url,
-        title: (row['title'] as string) || '',
-        source: (row['source'] as string) || (row['domain'] as string) || '',
-      })
+      if (url) results.push({ url, title: (row['title'] as string) || '', source: (row['source'] as string) || '' })
     }
   }
-
   return results
 }
 
-/* ─── Apify async polling ─────────────────────────────── */
-
 async function runApifyAsync(videoId: string, token: string): Promise<Match[]> {
-  const imageBase64 = await fetchThumbnailAsBase64(videoId)
-
-  const startRes = await fetch(
-    `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=1024`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        imagesBase64: [imageBase64],
-        searchTypes: ['visual-match'],
-      }),
-    }
-  )
-
-  if (!startRes.ok) {
-    const txt = await startRes.text()
-    throw new Error(`Apify start error ${startRes.status}: ${txt}`)
-  }
-
-  const startData = await startRes.json() as { data: { id: string } }
-  const runId = startData.data?.id
-  if (!runId) throw new Error('Apify did not return a run ID')
-
-  console.log(`[find-source] Apify run started: ${runId}`)
-
-  const deadline = Date.now() + 240_000
-  while (Date.now() < deadline) {
-    await sleep(5000)
-
-    const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${token}`)
-    if (!statusRes.ok) continue
-
-    const statusData = await statusRes.json() as {
-      data: { status: string; defaultDatasetId?: string; stats?: { itemCount?: number } }
-    }
-    const runStatus = statusData.data?.status
-    const itemCount = statusData.data?.stats?.itemCount ?? 0
-    const datasetId = statusData.data?.defaultDatasetId
-
-    console.log(`[find-source] run=${runId} status=${runStatus} items=${itemCount} dataset=${datasetId}`)
-
-    if (itemCount > 0 && datasetId) {
-      // Fetch via dataset ID directly for reliability
-      const dataRes = await fetch(
-        `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=30`
-      )
-      if (dataRes.ok) {
-        const rows = await dataRes.json() as Array<Record<string, unknown>>
-        console.log(`[find-source] dataset rows: ${rows.length}, first row keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
-        const matches = extractMatchesFromDataset(rows)
-        console.log(`[find-source] extracted ${matches.length} matches`)
-        if (matches.length > 0) return matches
+  try {
+    const imageBase64 = await fetchThumbnailAsBase64(videoId)
+    const startRes = await fetch(
+      `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=1024`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imagesBase64: [imageBase64], searchTypes: ['visual-match'] }),
       }
-    }
-
-    if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) {
-      // Final fetch — try both endpoints
-      const urls = datasetId
-        ? [
-            `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=30`,
-            `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`,
-          ]
-        : [`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`]
-
-      for (const url of urls) {
-        const dataRes = await fetch(url)
+    )
+    if (!startRes.ok) return []
+    const startData = await startRes.json() as { data: { id: string } }
+    const runId = startData.data?.id
+    if (!runId) return []
+    console.log(`[find-source] Apify run started: ${runId}`)
+    const deadline = Date.now() + 240_000
+    while (Date.now() < deadline) {
+      await sleep(5000)
+      const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${token}`)
+      if (!statusRes.ok) continue
+      const statusData = await statusRes.json() as {
+        data: { status: string; defaultDatasetId?: string; stats?: { itemCount?: number } }
+      }
+      const runStatus = statusData.data?.status
+      const itemCount = statusData.data?.stats?.itemCount ?? 0
+      const datasetId = statusData.data?.defaultDatasetId
+      console.log(`[find-source] run=${runId} status=${runStatus} items=${itemCount}`)
+      if (itemCount > 0 && datasetId) {
+        const dataRes = await fetch(`https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=30`)
         if (dataRes.ok) {
           const rows = await dataRes.json() as Array<Record<string, unknown>>
-          console.log(`[find-source] final rows: ${rows.length}, keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
           const matches = extractMatchesFromDataset(rows)
           if (matches.length > 0) return matches
         }
       }
-      break
+      if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) break
     }
+    return []
+  } catch (e) {
+    console.warn('[find-source] Apify error:', e)
+    return []
   }
-
-  return []
-}
-
-/* ─── SerpApi ─────────────────────────────────────────── */
-
-async function searchWithSerpApi(videoId: string, token: string): Promise<Match[]> {
-  const thumbUrls = [
-    `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
-    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-  ]
-  for (const thumbUrl of thumbUrls) {
-    const params = new URLSearchParams({ engine: 'google_lens', url: thumbUrl, api_key: token })
-    const res = await fetch(`https://serpapi.com/search?${params}`, {
-      signal: AbortSignal.timeout(30_000),
-    })
-    if (!res.ok) throw new Error(`SerpApi error ${res.status}: ${await res.text()}`)
-    const data = await res.json() as { visual_matches?: Array<Record<string, string>> }
-    const matches = (data.visual_matches || [])
-      .map((item) => ({ url: item['link'] || item['url'] || '', title: item['title'] || '', source: item['source'] || '' }))
-      .filter((m) => m.url)
-    if (matches.length > 0) return matches
-  }
-  return []
 }
 
 /* ─── Route handler ───────────────────────────────────── */
@@ -206,7 +229,7 @@ async function searchWithSerpApi(videoId: string, token: string): Promise<Match[
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json() as { url: string; provider?: string }
-    const { url, provider = 'apify' } = body
+    const { url } = body
 
     if (!url || typeof url !== 'string') {
       return NextResponse.json({ error: 'Please provide a valid YouTube URL' }, { status: 400 })
@@ -218,23 +241,42 @@ export async function POST(req: NextRequest) {
     }
 
     const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
+    console.log(`[find-source] Processing videoId: ${videoId}`)
 
-    if (provider === 'serpapi') {
-      const serpToken = process.env.SERPAPI_KEY
-      if (!serpToken) {
-        return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'SERPAPI_KEY is not configured.' })
+    // ── Step 1: YouTube oEmbed (free, instant, no key needed) ──
+    const oEmbedMatches = await getYouTubeOEmbed(videoId)
+    if (oEmbedMatches.length > 0) {
+      return NextResponse.json({ videoId, thumbnailUrl, matches: oEmbedMatches, method: 'youtube-oembed' })
+    }
+
+    // ── Step 2: YouTube Data API v3 (if YOUTUBE_API_KEY is set) ──
+    const ytKey = process.env.YOUTUBE_API_KEY
+    if (ytKey) {
+      const ytMatches = await getYouTubeDataAPI(videoId, ytKey)
+      if (ytMatches.length > 0) {
+        return NextResponse.json({ videoId, thumbnailUrl, matches: ytMatches, method: 'youtube-data-api' })
       }
-      const matches = await searchWithSerpApi(videoId, serpToken)
-      return NextResponse.json({ videoId, thumbnailUrl, matches })
     }
 
+    // ── Step 3: SerpApi Google Lens (if SERPAPI_KEY is set) ──
+    const serpToken = process.env.SERPAPI_KEY
+    if (serpToken) {
+      const serpMatches = await searchWithSerpApi(videoId, serpToken)
+      if (serpMatches.length > 0) {
+        return NextResponse.json({ videoId, thumbnailUrl, matches: serpMatches, method: 'serpapi' })
+      }
+    }
+
+    // ── Step 4: Apify Google Lens (if APIFY_API_TOKEN is set) ──
     const apifyToken = process.env.APIFY_API_TOKEN
-    if (!apifyToken) {
-      return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'APIFY_API_TOKEN is not configured.' })
+    if (apifyToken) {
+      const apifyMatches = await runApifyAsync(videoId, apifyToken)
+      if (apifyMatches.length > 0) {
+        return NextResponse.json({ videoId, thumbnailUrl, matches: apifyMatches, method: 'apify' })
+      }
     }
 
-    const matches = await runApifyAsync(videoId, apifyToken)
-    return NextResponse.json({ videoId, thumbnailUrl, matches })
+    return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'No results found. The video may be private or not indexed.' })
 
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal server error'
