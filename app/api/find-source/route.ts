@@ -27,25 +27,18 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-/**
- * Fetches the YouTube thumbnail for a given videoId and returns it as a
- * base64-encoded JPEG string (no data-URI prefix — just the raw base64).
- * Tries hqdefault first, falls back to mqdefault.
- */
 async function fetchThumbnailAsBase64(videoId: string): Promise<string> {
   const candidates = [
     `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/default.jpg`,
   ]
-
   for (const url of candidates) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(15_000) })
       if (!res.ok) continue
       const arrayBuffer = await res.arrayBuffer()
       const base64 = Buffer.from(arrayBuffer).toString('base64')
-      // Sanity check: a valid JPEG starts with /9j/ in base64
       if (base64.length > 1000) {
         console.log(`[find-source] fetched thumbnail from ${url} (${base64.length} chars base64)`)
         return base64
@@ -54,7 +47,6 @@ async function fetchThumbnailAsBase64(videoId: string): Promise<string> {
       console.warn(`[find-source] thumbnail fetch failed for ${url}:`, e)
     }
   }
-
   throw new Error('Could not fetch a valid YouTube thumbnail for base64 conversion.')
 }
 
@@ -62,31 +54,43 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
   const results: Match[] = []
 
   for (const row of rows) {
-    // ---- Case 1: MaNVYRogwHemtywEz — visualMatches array ----
-    if (Array.isArray(row['visualMatches'])) {
-      for (const m of row['visualMatches'] as Record<string, string>[]) {
-        const url = m['link'] || m['url'] || m['pageUrl'] || ''
-        if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
+    // Log all keys for debugging
+    console.log(`[find-source] row keys: ${Object.keys(row).join(', ')}`)
+
+    // Try every known key variant the actor might return
+    const candidates = [
+      row['visual-match'],   // kebab-case — confirmed from logs
+      row['visualMatches'],  // camelCase
+      row['visualMatch'],
+      row['matches'],
+      row['results'],
+    ]
+
+    let handled = false
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate) && candidate.length > 0) {
+        for (const m of candidate as Record<string, string>[]) {
+          const url = m['link'] || m['url'] || m['pageUrl'] || ''
+          if (url) results.push({
+            url,
+            title: m['title'] || m['name'] || '',
+            source: m['source'] || m['domain'] || m['siteName'] || '',
+          })
+        }
+        handled = true
+        break
       }
-      continue
     }
 
-    // ---- Case 2: legacy s-r~google-lens — matches array ----
-    if (Array.isArray(row['matches'])) {
-      for (const m of row['matches'] as Record<string, string>[]) {
-        const url = m['link'] || m['url'] || m['pageUrl'] || ''
-        if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
-      }
-      continue
+    if (!handled) {
+      // Flat item fallback
+      const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
+      if (url) results.push({
+        url,
+        title: (row['title'] as string) || '',
+        source: (row['source'] as string) || (row['domain'] as string) || '',
+      })
     }
-
-    // ---- Case 3: flat item ----
-    const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
-    if (url) results.push({
-      url,
-      title: (row['title'] as string) || '',
-      source: (row['source'] as string) || (row['domain'] as string) || '',
-    })
   }
 
   return results
@@ -95,8 +99,6 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
 /* ─── Apify async polling ─────────────────────────────── */
 
 async function runApifyAsync(videoId: string, token: string): Promise<Match[]> {
-  // Fetch thumbnail server-side and convert to base64 so Apify never needs
-  // to make an outbound HTTP request to YouTube — avoids the invalid-URL 400.
   const imageBase64 = await fetchThumbnailAsBase64(videoId)
 
   const startRes = await fetch(
@@ -105,7 +107,6 @@ async function runApifyAsync(videoId: string, token: string): Promise<Match[]> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        // Send the image as base64 — actor schema field: imagesBase64
         imagesBase64: [imageBase64],
         searchTypes: ['visual-match'],
       }),
@@ -131,20 +132,22 @@ async function runApifyAsync(videoId: string, token: string): Promise<Match[]> {
     if (!statusRes.ok) continue
 
     const statusData = await statusRes.json() as {
-      data: { status: string; stats?: { itemCount?: number } }
+      data: { status: string; defaultDatasetId?: string; stats?: { itemCount?: number } }
     }
     const runStatus = statusData.data?.status
     const itemCount = statusData.data?.stats?.itemCount ?? 0
+    const datasetId = statusData.data?.defaultDatasetId
 
-    console.log(`[find-source] run=${runId} status=${runStatus} items=${itemCount}`)
+    console.log(`[find-source] run=${runId} status=${runStatus} items=${itemCount} dataset=${datasetId}`)
 
-    if (itemCount > 0) {
+    if (itemCount > 0 && datasetId) {
+      // Fetch via dataset ID directly for reliability
       const dataRes = await fetch(
-        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`
+        `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=30`
       )
       if (dataRes.ok) {
         const rows = await dataRes.json() as Array<Record<string, unknown>>
-        console.log(`[find-source] raw first row keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
+        console.log(`[find-source] dataset rows: ${rows.length}, first row keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
         const matches = extractMatchesFromDataset(rows)
         console.log(`[find-source] extracted ${matches.length} matches`)
         if (matches.length > 0) return matches
@@ -152,13 +155,22 @@ async function runApifyAsync(videoId: string, token: string): Promise<Match[]> {
     }
 
     if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) {
-      const dataRes = await fetch(
-        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`
-      )
-      if (dataRes.ok) {
-        const rows = await dataRes.json() as Array<Record<string, unknown>>
-        console.log(`[find-source] final fetch keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
-        return extractMatchesFromDataset(rows)
+      // Final fetch — try both endpoints
+      const urls = datasetId
+        ? [
+            `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=30`,
+            `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`,
+          ]
+        : [`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${token}&limit=30`]
+
+      for (const url of urls) {
+        const dataRes = await fetch(url)
+        if (dataRes.ok) {
+          const rows = await dataRes.json() as Array<Record<string, unknown>>
+          console.log(`[find-source] final rows: ${rows.length}, keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
+          const matches = extractMatchesFromDataset(rows)
+          if (matches.length > 0) return matches
+        }
       }
       break
     }
@@ -205,7 +217,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Could not extract a valid YouTube video ID.' }, { status: 400 })
     }
 
-    // Kept for reference in the response — not sent to Apify anymore
     const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
 
     if (provider === 'serpapi') {
