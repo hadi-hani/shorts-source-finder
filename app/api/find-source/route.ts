@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 
 export const maxDuration = 300
 
-type Match = { url: string; title: string; source: string }
+type Match = { url: string; title: string; source: string; thumbnail?: string }
 
-/* ─── helpers ─────────────────────────────────────────── */
+/* ─── helpers ───────────────────────────────────────────── */
 
 function extractVideoId(inputUrl: string): string | null {
   try {
@@ -28,92 +28,116 @@ function sleep(ms: number) {
 }
 
 /* ─────────────────────────────────────────────────────────
-   STEP 1 — Collect multiple frame URLs from YouTube
-   YouTube provides storyboard sprites with frames at
-   different timestamps. We extract several distinct
-   thumbnail/frame URLs to use in reverse-image search.
+   STEP 1 — Extract real storyboard frame URLs + base64
+   YouTube storyboard URL provides frames at different
+   timestamps across the full video duration.
 ───────────────────────────────────────────────────────── */
 
 /**
- * YouTube thumbnail variants — each represents a different
- * moment in the video (cover, mid, end frames).
+ * Get all possible thumbnail/frame URLs for a YouTube video.
+ * These cover different moments: cover, frame1, frame2, frame3,
+ * plus standard quality variants.
  */
-function getFrameUrls(videoId: string): string[] {
+function getAllFrameUrls(videoId: string): string[] {
   return [
-    // Standard thumbnail options — different capture times
+    // Main thumbnail variants — different capture moments
     `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-    `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/sddefault.jpg`,
-    // Storyboard frames 1, 2, 3 (different moments)
+    `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+    // Storyboard frames 1,2,3 — beginning / middle / end of video
     `https://img.youtube.com/vi/${videoId}/1.jpg`,
     `https://img.youtube.com/vi/${videoId}/2.jpg`,
     `https://img.youtube.com/vi/${videoId}/3.jpg`,
+    // WebP variants (sometimes available)
+    `https://img.youtube.com/vi_webp/${videoId}/maxresdefault.webp`,
+    `https://img.youtube.com/vi_webp/${videoId}/hqdefault.webp`,
   ]
 }
 
 /**
- * Fetch a frame URL and return base64 string.
- * Returns null if the image is invalid (e.g., 120x90 placeholder).
+ * Fetch a single frame URL and return it as base64 data URL.
+ * Returns null if the image is a grey placeholder (< 5KB).
  */
-async function fetchFrameAsBase64(url: string): Promise<{ base64: string; url: string } | null> {
+async function fetchFrameAsBase64(
+  url: string
+): Promise<{ base64: string; dataUrl: string; url: string; mimeType: string } | null> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(12_000) })
-    if (!res.ok) return null
-    const buf = await res.arrayBuffer()
-    const b64 = Buffer.from(buf).toString('base64')
-    // YouTube returns a tiny 120x90 grey placeholder for missing frames
-    // Real frames are usually > 5KB
-    if (b64.length < 4000) {
-      console.log(`[frames] skipped placeholder: ${url}`)
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(12_000),
+    })
+    if (!res.ok) {
+      console.log(`[frames] ${url} → HTTP ${res.status}`)
       return null
     }
-    console.log(`[frames] fetched ${url} (${Math.round(b64.length / 1024)}KB base64)`)
-    return { base64: b64, url }
+    const contentType = res.headers.get('content-type') || 'image/jpeg'
+    const mimeType = contentType.split(';')[0].trim()
+    const buf = await res.arrayBuffer()
+    const bytes = buf.byteLength
+    // YouTube returns a tiny 120x90 grey placeholder for missing frames (< 5KB)
+    if (bytes < 5000) {
+      console.log(`[frames] placeholder skipped: ${url} (${bytes} bytes)`)
+      return null
+    }
+    const base64 = Buffer.from(buf).toString('base64')
+    const dataUrl = `data:${mimeType};base64,${base64}`
+    console.log(`[frames] ✓ ${url} (${Math.round(bytes / 1024)}KB, ${mimeType})`)
+    return { base64, dataUrl, url, mimeType }
   } catch (e) {
-    console.warn(`[frames] failed ${url}:`, e)
+    console.warn(`[frames] failed ${url}:`, (e as Error).message)
     return null
   }
 }
 
+interface FrameResult {
+  base64: string
+  dataUrl: string
+  url: string
+  mimeType: string
+}
+
 /**
- * Collect up to `maxFrames` valid base64 frames from the video.
+ * Collect up to `maxFrames` valid frames from a video.
+ * Tries all known URLs and returns the first `maxFrames` that pass validation.
  */
-async function collectFrames(
-  videoId: string,
-  maxFrames = 4
-): Promise<{ base64: string; url: string }[]> {
-  const urls = getFrameUrls(videoId)
-  const results: { base64: string; url: string }[] = []
+async function collectFrames(videoId: string, maxFrames = 5): Promise<FrameResult[]> {
+  const urls = getAllFrameUrls(videoId)
+  const results: FrameResult[] = []
+  const seen = new Set<string>()
 
   for (const url of urls) {
     if (results.length >= maxFrames) break
     const frame = await fetchFrameAsBase64(url)
-    if (frame) results.push(frame)
+    if (frame && !seen.has(frame.base64.slice(0, 100))) {
+      seen.add(frame.base64.slice(0, 100))
+      results.push(frame)
+    }
   }
 
-  console.log(`[frames] collected ${results.length} valid frames for ${videoId}`)
+  console.log(`[frames] collected ${results.length}/${maxFrames} frames for videoId=${videoId}`)
   return results
 }
 
 /* ─────────────────────────────────────────────────────────
-   STEP 2 — Apify Google Reverse Image Search
+   STEP 2A — Apify: Google Reverse Image Search
    Actor: MaNVYRogwHemtywEz
-   Input: imagesBase64 array + imageUrls array
-   We send BOTH base64 frames AND public URLs.
+   We try multiple input schemas because different actor
+   versions accept different field names.
 ───────────────────────────────────────────────────────── */
 
 function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[] {
   const results: Match[] = []
 
   for (const row of rows) {
-    const allKeys = Object.keys(row)
-    console.log(`[apify] row keys: ${allKeys.join(', ')}`)
+    const keys = Object.keys(row)
+    console.log(`[apify] row keys: ${keys.slice(0, 20).join(', ')}`)
 
-    // Try every key variant the actor might produce
+    // All possible array keys the actor might use
     const arrayKeys = [
       'visual-match', 'visualMatches', 'visualMatch',
       'matches', 'results', 'items', 'data',
+      'pages', 'links', 'relatedImages', 'similar',
     ]
 
     let handled = false
@@ -126,7 +150,8 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
             results.push({
               url,
               title: m['title'] || m['name'] || m['text'] || '',
-              source: m['source'] || m['domain'] || m['siteName'] || new URL(url).hostname,
+              source: m['source'] || m['domain'] || m['siteName'] || '',
+              thumbnail: m['thumbnail'] || m['image'] || m['imageUrl'] || '',
             })
           }
         }
@@ -136,13 +161,13 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
     }
 
     if (!handled) {
-      // Maybe the row itself IS a match (flat structure)
-      const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
+      const url = (row['link'] || row['url'] || row['pageUrl'] || row['href']) as string | undefined
       if (url) {
         results.push({
           url,
           title: (row['title'] as string) || '',
           source: (row['source'] as string) || (row['domain'] as string) || '',
+          thumbnail: (row['thumbnail'] as string) || '',
         })
       }
     }
@@ -155,8 +180,9 @@ async function pollApifyRun(
   runId: string,
   token: string,
   timeoutMs = 240_000
-): Promise<Match[]> {
+): Promise<{ matches: Match[]; rawSample: string }> {
   const deadline = Date.now() + timeoutMs
+  let rawSample = ''
 
   while (Date.now() < deadline) {
     await sleep(6000)
@@ -164,18 +190,15 @@ async function pollApifyRun(
     const statusRes = await fetch(
       `https://api.apify.com/v2/actor-runs/${runId}?token=${token}`,
       { signal: AbortSignal.timeout(10_000) }
-    )
-    if (!statusRes.ok) {
-      console.warn(`[apify] status check failed: ${statusRes.status}`)
+    ).catch(() => null)
+
+    if (!statusRes || !statusRes.ok) {
+      console.warn(`[apify] status check failed`)
       continue
     }
 
     const statusData = await statusRes.json() as {
-      data: {
-        status: string
-        defaultDatasetId?: string
-        stats?: { itemCount?: number }
-      }
+      data: { status: string; defaultDatasetId?: string; stats?: { itemCount?: number } }
     }
 
     const runStatus = statusData.data?.status
@@ -184,20 +207,19 @@ async function pollApifyRun(
 
     console.log(`[apify] run=${runId} status=${runStatus} items=${itemCount} dataset=${datasetId}`)
 
-    // Try to fetch results as soon as items appear
     if (itemCount > 0 && datasetId) {
       const rows = await fetchDatasetRows(datasetId, token)
       const matches = extractMatchesFromDataset(rows)
       if (matches.length > 0) {
         console.log(`[apify] early exit with ${matches.length} matches`)
-        return matches
+        return { matches, rawSample }
       }
     }
 
-    // Terminal state — do a final fetch regardless
     if (['SUCCEEDED', 'FAILED', 'TIMED-OUT', 'ABORTED'].includes(runStatus)) {
-      console.log(`[apify] run terminal: ${runStatus}`)
+      console.log(`[apify] terminal: ${runStatus}`)
 
+      // Fetch from dataset
       const fetchUrls = [
         datasetId
           ? `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=50`
@@ -207,26 +229,20 @@ async function pollApifyRun(
 
       for (const fetchUrl of fetchUrls) {
         const rows = await fetchDatasetRows(undefined, token, fetchUrl)
+        // Capture raw for debugging
+        if (rows.length > 0 && !rawSample) {
+          rawSample = JSON.stringify(rows.slice(0, 2)).slice(0, 1000)
+          console.log(`[apify] raw sample: ${rawSample}`)
+        }
         const matches = extractMatchesFromDataset(rows)
-        if (matches.length > 0) return matches
-      }
-
-      // Log raw output for debugging
-      if (datasetId) {
-        try {
-          const rawRes = await fetch(
-            `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=5`
-          )
-          const raw = await rawRes.text()
-          console.log(`[apify] raw dataset sample: ${raw.slice(0, 500)}`)
-        } catch { /* ignore */ }
+        if (matches.length > 0) return { matches, rawSample }
       }
 
       break
     }
   }
 
-  return []
+  return { matches: [], rawSample }
 }
 
 async function fetchDatasetRows(
@@ -234,121 +250,150 @@ async function fetchDatasetRows(
   token: string,
   overrideUrl?: string
 ): Promise<Array<Record<string, unknown>>> {
-  const url = overrideUrl ||
+  const url =
+    overrideUrl ||
     `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&limit=50`
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(15_000) })
     if (!res.ok) return []
-    return await res.json() as Array<Record<string, unknown>>
+    return (await res.json()) as Array<Record<string, unknown>>
   } catch {
     return []
   }
 }
 
 /**
- * Run Apify Google Reverse Image Search actor with:
- * - Multiple frame base64 images
- * - Multiple frame public URLs
- * Both are sent so the actor can try whichever works.
+ * Try multiple input schemas for Apify actor MaNVYRogwHemtywEz.
+ * Different builds of this actor accept different field names.
  */
 async function runApifyWithFrames(
   videoId: string,
-  token: string
-): Promise<Match[]> {
-  // Collect up to 4 frames as base64
-  const frames = await collectFrames(videoId, 4)
-
+  token: string,
+  frames: FrameResult[]
+): Promise<{ matches: Match[]; method: string; rawSample: string }> {
   if (frames.length === 0) {
-    console.error('[apify] no frames could be fetched — aborting Apify run')
-    return []
+    console.error('[apify] no frames available')
+    return { matches: [], method: 'apify-noframes', rawSample: '' }
   }
 
-  const imagesBase64 = frames.map((f) => f.base64)
-  // Also send the public URLs as fallback
   const imageUrls = frames.map((f) => f.url)
+  const imagesBase64 = frames.map((f) => f.base64)
+  // Some actor versions want full data URLs
+  const imagesDataUrl = frames.map((f) => f.dataUrl)
 
-  console.log(`[apify] starting run with ${frames.length} frames (base64+url)`)
-
-  // Try input format A: base64 array
-  const inputA = {
-    imagesBase64,
-    imageUrls,
-    searchTypes: ['visual-match'],
-    maxResults: 20,
-  }
-
-  const startRes = await fetch(
-    `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=2048&timeout=180`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(inputA),
-      signal: AbortSignal.timeout(30_000),
-    }
-  )
-
-  if (!startRes.ok) {
-    const errText = await startRes.text()
-    console.error(`[apify] start failed ${startRes.status}: ${errText}`)
-    // Try fallback input format B: URLs only (no base64)
-    return runApifyUrlsOnly(videoId, token)
-  }
-
-  const startData = await startRes.json() as { data: { id: string } }
-  const runId = startData.data?.id
-  if (!runId) {
-    console.error('[apify] no run ID returned')
-    return []
-  }
-
-  console.log(`[apify] run started: ${runId}`)
-  return pollApifyRun(runId, token)
-}
-
-/**
- * Fallback: send only public YouTube thumbnail URLs (no base64).
- * Some actor versions prefer imageUrls over imagesBase64.
- */
-async function runApifyUrlsOnly(videoId: string, token: string): Promise<Match[]> {
-  const imageUrls = [
-    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-    `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
-    `https://img.youtube.com/vi/${videoId}/1.jpg`,
-    `https://img.youtube.com/vi/${videoId}/2.jpg`,
+  // Schema variants to try — ordered by most likely to work
+  const schemas = [
+    // Schema A: standard field names
+    { imagesBase64, imageUrls, searchTypes: ['visual-match'], maxResults: 20 },
+    // Schema B: only URLs (no base64) — some versions reject base64
+    { imageUrls, searchTypes: ['visual-match'], maxResults: 20 },
+    // Schema C: data URLs instead of raw base64
+    { imagesBase64: imagesDataUrl, searchTypes: ['visual-match'], maxResults: 20 },
+    // Schema D: single image URL, minimal input
+    { imageUrl: imageUrls[0], maxResults: 20 },
+    // Schema E: "queries" format used by some Google Lens actors
+    { queries: imageUrls.map((u) => ({ imageUrl: u })), maxResults: 20 },
+    // Schema F: just startUrls with image URL
+    { startUrls: [{ url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(imageUrls[0])}` }], maxResults: 20 },
   ]
 
-  console.log(`[apify] fallback: sending ${imageUrls.length} public URLs only`)
+  for (let i = 0; i < schemas.length; i++) {
+    const schema = schemas[i]
+    console.log(`[apify] trying schema ${i + 1}/${schemas.length}:`, JSON.stringify(schema).slice(0, 200))
 
-  const startRes = await fetch(
-    `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=2048&timeout=180`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        imageUrls,
-        searchTypes: ['visual-match'],
-        maxResults: 20,
-      }),
-      signal: AbortSignal.timeout(30_000),
+    const startRes = await fetch(
+      `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=2048&timeout=180`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(schema),
+        signal: AbortSignal.timeout(30_000),
+      }
+    ).catch((e) => { console.error('[apify] start error:', e); return null })
+
+    if (!startRes || !startRes.ok) {
+      const errText = startRes ? await startRes.text() : 'network error'
+      console.error(`[apify] schema ${i + 1} start failed:`, errText.slice(0, 300))
+      continue
     }
-  )
 
-  if (!startRes.ok) {
-    const errText = await startRes.text()
-    console.error(`[apify] fallback start failed ${startRes.status}: ${errText}`)
-    return []
+    const startData = await startRes.json() as { data: { id: string } }
+    const runId = startData.data?.id
+    if (!runId) {
+      console.error('[apify] no run ID')
+      continue
+    }
+
+    console.log(`[apify] schema ${i + 1} run started: ${runId}`)
+    const { matches, rawSample } = await pollApifyRun(runId, token)
+
+    if (matches.length > 0) {
+      console.log(`[apify] schema ${i + 1} SUCCESS — ${matches.length} matches`)
+      return { matches, method: `apify-schema${i + 1}`, rawSample }
+    }
+
+    console.log(`[apify] schema ${i + 1} returned 0 results, trying next schema...`)
   }
 
-  const startData = await startRes.json() as { data: { id: string } }
-  const runId = startData.data?.id
-  if (!runId) return []
-
-  console.log(`[apify] fallback run started: ${runId}`)
-  return pollApifyRun(runId, token)
+  return { matches: [], method: 'apify-all-schemas-failed', rawSample: '' }
 }
 
 /* ─────────────────────────────────────────────────────────
-   STEP 3 — SerpApi Google Lens (reliable fallback)
+   STEP 2B — Apify: Google Lens actor (nwua9Gu5YrADL7ZDj)
+   Alternative actor from Apify Store — official Google Lens
+   scraper. Uses imageUrl field.
+───────────────────────────────────────────────────────── */
+
+async function runApifyGoogleLensActor(
+  videoId: string,
+  token: string,
+  frames: FrameResult[]
+): Promise<{ matches: Match[]; method: string; rawSample: string }> {
+  const imageUrls = frames.map((f) => f.url)
+  if (imageUrls.length === 0) return { matches: [], method: 'apify-lens-noframes', rawSample: '' }
+
+  // Google Lens actor accepts one URL per run — try first 3 frames
+  for (let i = 0; i < Math.min(3, imageUrls.length); i++) {
+    const imageUrl = imageUrls[i]
+    console.log(`[apify-lens] trying frame ${i + 1}: ${imageUrl}`)
+
+    const startRes = await fetch(
+      `https://api.apify.com/v2/acts/nwua9Gu5YrADL7ZDj/runs?token=${token}&memory=2048&timeout=180`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl,
+          maxResults: 20,
+          outputType: 'all',
+        }),
+        signal: AbortSignal.timeout(30_000),
+      }
+    ).catch(() => null)
+
+    if (!startRes || !startRes.ok) {
+      const err = startRes ? await startRes.text() : 'network error'
+      console.error(`[apify-lens] start failed:`, err.slice(0, 200))
+      continue
+    }
+
+    const startData = await startRes.json() as { data: { id: string } }
+    const runId = startData.data?.id
+    if (!runId) continue
+
+    console.log(`[apify-lens] run started: ${runId}`)
+    const { matches, rawSample } = await pollApifyRun(runId, token)
+
+    if (matches.length > 0) {
+      return { matches, method: 'apify-google-lens', rawSample }
+    }
+  }
+
+  return { matches: [], method: 'apify-lens-no-results', rawSample: '' }
+}
+
+/* ─────────────────────────────────────────────────────────
+   STEP 3 — SerpApi Google Lens (reliable)
 ───────────────────────────────────────────────────────── */
 
 async function searchWithSerpApi(videoId: string, token: string): Promise<Match[]> {
@@ -359,8 +404,6 @@ async function searchWithSerpApi(videoId: string, token: string): Promise<Match[
     `https://img.youtube.com/vi/${videoId}/2.jpg`,
     `https://img.youtube.com/vi/${videoId}/3.jpg`,
   ]
-
-  const allMatches: Match[] = []
 
   for (const thumbUrl of thumbUrls) {
     try {
@@ -375,17 +418,14 @@ async function searchWithSerpApi(videoId: string, token: string): Promise<Match[
           url: item['link'] || item['url'] || '',
           title: item['title'] || '',
           source: item['source'] || '',
+          thumbnail: item['thumbnail'] || '',
         }))
         .filter((m) => m.url)
-      if (matches.length > 0) {
-        allMatches.push(...matches)
-        // Got results from one frame — enough
-        break
-      }
+      if (matches.length > 0) return matches
     } catch { /* try next */ }
   }
 
-  return allMatches
+  return []
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -407,45 +447,79 @@ export async function POST(req: NextRequest) {
     }
 
     const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
-    console.log(`[find-source] Processing videoId=${videoId} provider=${provider || 'auto'}`)
+    const allFrameUrls = getAllFrameUrls(videoId)
+    console.log(`[find-source] videoId=${videoId} provider=${provider || 'auto'}`)
 
-    // Collect frames info for response
-    const frameUrls = getFrameUrls(videoId)
+    // ── Collect frames (used by all Apify methods) ────────
+    const frames = await collectFrames(videoId, 5)
+    const frameUrls = frames.map((f) => f.url)
 
-    // ── Force Apify if provider=apify ──────────────────────
+    // ── Force Apify (primary actor) ───────────────────────
     if (provider === 'apify') {
       const apifyToken = process.env.APIFY_API_TOKEN
       if (!apifyToken) {
-        return NextResponse.json({ error: 'APIFY_API_TOKEN is not configured in environment.' }, { status: 500 })
+        return NextResponse.json(
+          { error: 'APIFY_API_TOKEN not configured.' },
+          { status: 500 }
+        )
       }
-      const matches = await runApifyWithFrames(videoId, apifyToken)
-      return NextResponse.json({ videoId, thumbnailUrl, frameUrls, matches, method: 'apify' })
+      // Try primary actor with all schemas
+      const primary = await runApifyWithFrames(videoId, apifyToken, frames)
+      if (primary.matches.length > 0) {
+        return NextResponse.json({
+          videoId, thumbnailUrl, frameUrls, allFrameUrls,
+          matches: primary.matches,
+          method: primary.method,
+        })
+      }
+      // Try alternative Google Lens actor
+      console.log('[find-source] primary actor failed, trying Google Lens actor...')
+      const lens = await runApifyGoogleLensActor(videoId, apifyToken, frames)
+      return NextResponse.json({
+        videoId, thumbnailUrl, frameUrls, allFrameUrls,
+        matches: lens.matches,
+        method: lens.method,
+        apifyDebug: {
+          primaryRawSample: primary.rawSample,
+          lensRawSample: lens.rawSample,
+          framesCollected: frames.length,
+          frameUrls,
+        },
+      })
     }
 
-    // ── Force SerpApi if provider=serpapi ──────────────────
+    // ── Force SerpApi ─────────────────────────────────────
     if (provider === 'serpapi') {
       const serpToken = process.env.SERPAPI_KEY
       if (!serpToken) {
-        return NextResponse.json({ error: 'SERPAPI_KEY is not configured in environment.' }, { status: 500 })
+        return NextResponse.json({ error: 'SERPAPI_KEY not configured.' }, { status: 500 })
       }
       const matches = await searchWithSerpApi(videoId, serpToken)
       return NextResponse.json({ videoId, thumbnailUrl, frameUrls, matches, method: 'serpapi' })
     }
 
-    // ── Auto mode: try Apify first, then SerpApi ──────────
+    // ── Auto: try Apify first, then SerpApi ──────────────
     const apifyToken = process.env.APIFY_API_TOKEN
     if (apifyToken) {
-      console.log('[find-source] trying Apify...')
-      const matches = await runApifyWithFrames(videoId, apifyToken)
-      if (matches.length > 0) {
-        return NextResponse.json({ videoId, thumbnailUrl, frameUrls, matches, method: 'apify' })
+      console.log('[find-source] auto: trying Apify primary actor...')
+      const primary = await runApifyWithFrames(videoId, apifyToken, frames)
+      if (primary.matches.length > 0) {
+        return NextResponse.json({
+          videoId, thumbnailUrl, frameUrls, matches: primary.matches, method: primary.method,
+        })
       }
-      console.log('[find-source] Apify returned 0 results, falling back to SerpApi')
+      console.log('[find-source] auto: Apify primary returned 0, trying Google Lens actor...')
+      const lens = await runApifyGoogleLensActor(videoId, apifyToken, frames)
+      if (lens.matches.length > 0) {
+        return NextResponse.json({
+          videoId, thumbnailUrl, frameUrls, matches: lens.matches, method: lens.method,
+        })
+      }
+      console.log('[find-source] auto: all Apify actors returned 0, falling back to SerpApi...')
     }
 
     const serpToken = process.env.SERPAPI_KEY
     if (serpToken) {
-      console.log('[find-source] trying SerpApi...')
       const matches = await searchWithSerpApi(videoId, serpToken)
       if (matches.length > 0) {
         return NextResponse.json({ videoId, thumbnailUrl, frameUrls, matches, method: 'serpapi' })
@@ -453,11 +527,9 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({
-      videoId,
-      thumbnailUrl,
-      frameUrls,
+      videoId, thumbnailUrl, frameUrls, allFrameUrls,
       matches: [],
-      note: 'No results found. The video may be too new, private, or not indexed.',
+      note: 'No results found. Video may be too new or not indexed.',
     })
 
   } catch (err: unknown) {
