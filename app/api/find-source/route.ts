@@ -23,17 +23,39 @@ function extractVideoId(inputUrl: string): string | null {
   } catch { return null }
 }
 
-/**
- * Returns a publicly accessible thumbnail URL for the given videoId.
- * Uses img.youtube.com which Apify can fetch without redirect issues.
- */
-function getPublicThumbnailUrl(videoId: string): string {
-  // img.youtube.com is a stable public CDN that resolves without redirects
-  return `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
-}
-
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+/**
+ * Fetches the YouTube thumbnail for a given videoId and returns it as a
+ * base64-encoded JPEG string (no data-URI prefix — just the raw base64).
+ * Tries hqdefault first, falls back to mqdefault.
+ */
+async function fetchThumbnailAsBase64(videoId: string): Promise<string> {
+  const candidates = [
+    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+    `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+    `https://img.youtube.com/vi/${videoId}/default.jpg`,
+  ]
+
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) })
+      if (!res.ok) continue
+      const arrayBuffer = await res.arrayBuffer()
+      const base64 = Buffer.from(arrayBuffer).toString('base64')
+      // Sanity check: a valid JPEG starts with /9j/ in base64
+      if (base64.length > 1000) {
+        console.log(`[find-source] fetched thumbnail from ${url} (${base64.length} chars base64)`)
+        return base64
+      }
+    } catch (e) {
+      console.warn(`[find-source] thumbnail fetch failed for ${url}:`, e)
+    }
+  }
+
+  throw new Error('Could not fetch a valid YouTube thumbnail for base64 conversion.')
 }
 
 function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[] {
@@ -72,24 +94,29 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
 
 /* ─── Apify async polling ─────────────────────────────── */
 
-async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> {
+async function runApifyAsync(videoId: string, token: string): Promise<Match[]> {
+  // Fetch thumbnail server-side and convert to base64 so Apify never needs
+  // to make an outbound HTTP request to YouTube — avoids the invalid-URL 400.
+  const imageBase64 = await fetchThumbnailAsBase64(videoId)
+
   const startRes = await fetch(
     `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=1024`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        imageUrl,
-        imageUrls: [imageUrl],
-        // Correct enum value as required by the actor schema
+        // Send the image as base64 — actor schema field: imagesBase64
+        imagesBase64: [imageBase64],
         searchTypes: ['visual-match'],
       }),
     }
   )
+
   if (!startRes.ok) {
     const txt = await startRes.text()
     throw new Error(`Apify start error ${startRes.status}: ${txt}`)
   }
+
   const startData = await startRes.json() as { data: { id: string } }
   const runId = startData.data?.id
   if (!runId) throw new Error('Apify did not return a run ID')
@@ -178,7 +205,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Could not extract a valid YouTube video ID.' }, { status: 400 })
     }
 
-    const thumbnailUrl = getPublicThumbnailUrl(videoId)
+    // Kept for reference in the response — not sent to Apify anymore
+    const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
 
     if (provider === 'serpapi') {
       const serpToken = process.env.SERPAPI_KEY
@@ -194,7 +222,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'APIFY_API_TOKEN is not configured.' })
     }
 
-    const matches = await runApifyAsync(thumbnailUrl, apifyToken)
+    const matches = await runApifyAsync(videoId, apifyToken)
     return NextResponse.json({ videoId, thumbnailUrl, matches })
 
   } catch (err: unknown) {
