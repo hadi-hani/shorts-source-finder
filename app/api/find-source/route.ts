@@ -23,10 +23,13 @@ function extractVideoId(inputUrl: string): string | null {
   } catch { return null }
 }
 
-function getThumbnailUrls(videoId: string): string[] {
-  return ['maxresdefault', 'sddefault', 'hqdefault', '0'].map(
-    (q) => `https://i.ytimg.com/vi/${videoId}/${q}.jpg`
-  )
+/**
+ * Returns a publicly accessible thumbnail URL for the given videoId.
+ * Uses img.youtube.com which Apify can fetch without redirect issues.
+ */
+function getPublicThumbnailUrl(videoId: string): string {
+  // img.youtube.com is a stable public CDN that resolves without redirects
+  return `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
 }
 
 function sleep(ms: number) {
@@ -37,45 +40,31 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
   const results: Match[] = []
 
   for (const row of rows) {
-    // ---- Case 1: MaNVYRogwHemtywEz format — visualMatches array ----
+    // ---- Case 1: MaNVYRogwHemtywEz — visualMatches array ----
     if (Array.isArray(row['visualMatches'])) {
       for (const m of row['visualMatches'] as Record<string, string>[]) {
         const url = m['link'] || m['url'] || m['pageUrl'] || ''
-        if (url) {
-          results.push({
-            url,
-            title: m['title'] || '',
-            source: m['source'] || m['domain'] || '',
-          })
-        }
+        if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
       }
       continue
     }
 
-    // ---- Case 2: legacy s-r~google-lens format — matches array ----
+    // ---- Case 2: legacy s-r~google-lens — matches array ----
     if (Array.isArray(row['matches'])) {
       for (const m of row['matches'] as Record<string, string>[]) {
         const url = m['link'] || m['url'] || m['pageUrl'] || ''
-        if (url) {
-          results.push({
-            url,
-            title: m['title'] || '',
-            source: m['source'] || m['domain'] || '',
-          })
-        }
+        if (url) results.push({ url, title: m['title'] || '', source: m['source'] || m['domain'] || '' })
       }
       continue
     }
 
     // ---- Case 3: flat item ----
     const url = (row['link'] || row['url'] || row['pageUrl']) as string | undefined
-    if (url) {
-      results.push({
-        url,
-        title: (row['title'] as string) || '',
-        source: (row['source'] as string) || (row['domain'] as string) || '',
-      })
-    }
+    if (url) results.push({
+      url,
+      title: (row['title'] as string) || '',
+      source: (row['source'] as string) || (row['domain'] as string) || '',
+    })
   }
 
   return results
@@ -84,7 +73,6 @@ function extractMatchesFromDataset(rows: Array<Record<string, unknown>>): Match[
 /* ─── Apify async polling ─────────────────────────────── */
 
 async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> {
-  // Start run — include searchTypes (required by MaNVYRogwHemtywEz)
   const startRes = await fetch(
     `https://api.apify.com/v2/acts/MaNVYRogwHemtywEz/runs?token=${token}&memory=1024`,
     {
@@ -93,7 +81,8 @@ async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> 
       body: JSON.stringify({
         imageUrl,
         imageUrls: [imageUrl],
-        searchTypes: ['visualMatches'],
+        // Correct enum value as required by the actor schema
+        searchTypes: ['visual-match'],
       }),
     }
   )
@@ -107,7 +96,6 @@ async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> 
 
   console.log(`[find-source] Apify run started: ${runId}`)
 
-  // Poll every 5 seconds
   const deadline = Date.now() + 240_000
   while (Date.now() < deadline) {
     await sleep(5000)
@@ -142,7 +130,7 @@ async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> 
       )
       if (dataRes.ok) {
         const rows = await dataRes.json() as Array<Record<string, unknown>>
-        console.log(`[find-source] final fetch first row keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
+        console.log(`[find-source] final fetch keys: ${Object.keys(rows[0] ?? {}).join(', ')}`)
         return extractMatchesFromDataset(rows)
       }
       break
@@ -155,7 +143,11 @@ async function runApifyAsync(imageUrl: string, token: string): Promise<Match[]> 
 /* ─── SerpApi ─────────────────────────────────────────── */
 
 async function searchWithSerpApi(videoId: string, token: string): Promise<Match[]> {
-  for (const thumbUrl of getThumbnailUrls(videoId)) {
+  const thumbUrls = [
+    `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+  ]
+  for (const thumbUrl of thumbUrls) {
     const params = new URLSearchParams({ engine: 'google_lens', url: thumbUrl, api_key: token })
     const res = await fetch(`https://serpapi.com/search?${params}`, {
       signal: AbortSignal.timeout(30_000),
@@ -186,7 +178,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Could not extract a valid YouTube video ID.' }, { status: 400 })
     }
 
-    const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+    const thumbnailUrl = getPublicThumbnailUrl(videoId)
 
     if (provider === 'serpapi') {
       const serpToken = process.env.SERPAPI_KEY
@@ -202,8 +194,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ videoId, thumbnailUrl, matches: [], note: 'APIFY_API_TOKEN is not configured.' })
     }
 
-    const thumbUrl = getThumbnailUrls(videoId)[2] // hqdefault
-    const matches = await runApifyAsync(thumbUrl, apifyToken)
+    const matches = await runApifyAsync(thumbnailUrl, apifyToken)
     return NextResponse.json({ videoId, thumbnailUrl, matches })
 
   } catch (err: unknown) {
